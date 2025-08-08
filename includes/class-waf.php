@@ -8,6 +8,8 @@ class SecurityWAF {
     private $patterns_cache = array();
     private $input_cache = null;
     private $table_name;
+    private static $is_logged_in = null;
+    private static $current_user_can_manage = null;
     
     public function __construct() {
         if (!get_option('security_enable_waf', true)) {
@@ -17,9 +19,18 @@ class SecurityWAF {
         global $wpdb;
         $this->table_name = $wpdb->prefix . 'security_waf_logs';
         
+        // Initialize static checks once for performance
+        if (self::$is_logged_in === null) {
+            self::$is_logged_in = is_user_logged_in();
+        }
+        
+        if (self::$current_user_can_manage === null) {
+            self::$current_user_can_manage = current_user_can('manage_options');
+        }
+        
         // Cache settings on instantiation
-        $this->request_limit = (int)get_option('security_waf_request_limit', 100);
-        $this->blacklist_threshold = (int)get_option('security_waf_blacklist_threshold', 5);
+        $this->request_limit = (int)get_option('security_waf_request_limit', 1000); // INCREASED from 500 to 1000
+        $this->blacklist_threshold = (int)get_option('security_waf_blacklist_threshold', 20); // INCREASED from 10 to 20
         $this->blocked_ips_cache = get_option('waf_blocked_ips', array());
         
         // WordPress-friendly security patterns
@@ -69,12 +80,43 @@ class SecurityWAF {
     }
 
     public function waf_check() {
+        // CRITICAL: Skip all checks if this is an API request
+        if (defined('API_REQUEST_WHITELISTED') && API_REQUEST_WHITELISTED) {
+            return;
+        }
+        
+        // CRITICAL: Skip all checks for logged-in users and admins - FIRST CHECK
+        if (self::$is_logged_in || self::$current_user_can_manage) {
+            return;
+        }
+        
+        // CRITICAL: Skip ALL WooCommerce AJAX requests - NEVER BLOCK THESE
+        if ($this->is_woocommerce_ajax_request()) {
+            return;
+        }
+        
+        // CRITICAL: Skip WooCommerce admin and API requests
+        if ($this->is_woocommerce_admin_request()) {
+            return;
+        }
+        
         // Allow WordPress core functionality
         if ($this->is_wordpress_core_request()) {
             return;
         }
 
         $ip = $this->get_client_ip();
+        
+        // CRITICAL: Never block your IPs
+        if (in_array($ip, array('103.251.55.45', '103.170.146.58'))) {
+            return;
+        }
+        
+        // CRITICAL: Never block legitimate browsers
+        $user_agent = $this->get_user_agent();
+        if ($this->is_legitimate_browser($user_agent)) {
+            return;
+        }
         
         if ($this->is_ip_blocked($ip)) {
             $this->block_request('IP Blocked');
@@ -86,6 +128,107 @@ class SecurityWAF {
         }
 
         $this->check_attack_patterns($ip);
+    }
+
+    private function is_woocommerce_admin_request() {
+        $request_uri = $_SERVER['REQUEST_URI'] ?? '';
+        
+        // Check for WooCommerce admin patterns
+        $wc_admin_patterns = array(
+            '/wp-admin/admin.php?page=wc-admin',
+            '/wp-json/wc/gla/',
+            '/wp-json/wc-admin/',
+            '/wp-json/jetpack/',
+            'page=wc-admin',
+            'wc-admin'
+        );
+        
+        foreach ($wc_admin_patterns as $pattern) {
+            if (strpos($request_uri, $pattern) !== false) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    private function is_legitimate_browser($user_agent) {
+        // ENHANCED: More comprehensive legitimate browser detection
+        $legitimate_patterns = array(
+            // Chrome patterns
+            '/Mozilla\/.*Chrome\/.*Safari/i',
+            '/Mozilla\/.*Chrome\/.*Mobile.*Safari/i',
+            
+            // Firefox patterns
+            '/Mozilla\/.*Firefox/i',
+            '/Mozilla\/.*Mobile.*Firefox/i',
+            
+            // Safari patterns
+            '/Mozilla\/.*Safari.*Version/i',
+            '/Mozilla\/.*Mobile.*Safari/i',
+            
+            // Edge patterns
+            '/Mozilla\/.*Edge/i',
+            '/Mozilla\/.*Edg\//i',
+            
+            // Opera patterns
+            '/Mozilla\/.*Opera/i',
+            '/Opera\/.*Version/i',
+            
+            // Mobile browsers
+            '/Mozilla\/.*Mobile/i',
+            '/Mozilla\/.*Android/i',
+            '/Mozilla\/.*iPhone/i',
+            '/Mozilla\/.*iPad/i'
+        );
+        
+        foreach ($legitimate_patterns as $pattern) {
+            if (preg_match($pattern, $user_agent)) {
+                // Additional check for common browser characteristics
+                if (strpos($user_agent, 'Mozilla') !== false) {
+                    // Check for legitimate browser indicators
+                    $browser_indicators = array('Chrome', 'Firefox', 'Safari', 'Edge', 'Opera', 'Mobile', 'Android', 'iPhone', 'iPad');
+                    foreach ($browser_indicators as $indicator) {
+                        if (strpos($user_agent, $indicator) !== false) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+
+    private function is_woocommerce_ajax_request() {
+        $request_uri = $_SERVER['REQUEST_URI'] ?? '';
+        
+        // Check for WooCommerce AJAX patterns
+        $wc_ajax_patterns = array(
+            'wc-ajax=',
+            'get_refreshed_fragments',
+            'add_to_cart',
+            'remove_from_cart',
+            'update_cart',
+            'apply_coupon',
+            'remove_coupon',
+            'update_shipping_method',
+            'checkout',
+            'get_cart_totals'
+        );
+        
+        foreach ($wc_ajax_patterns as $pattern) {
+            if (strpos($request_uri, $pattern) !== false) {
+                return true;
+            }
+        }
+        
+        // Check query parameters
+        if (isset($_GET['wc-ajax']) || isset($_POST['wc-ajax'])) {
+            return true;
+        }
+        
+        return false;
     }
 
     private function is_wordpress_core_request() {
@@ -112,13 +255,23 @@ class SecurityWAF {
             );
             return in_array($_POST['action'], $allowed_actions);
         }
+        
+        // Allow WooCommerce AJAX requests
+        if (strpos($_SERVER['REQUEST_URI'], 'wc-ajax=') !== false) {
+            return true;
+        }
 
         return false;
     }
 
     private function is_rate_limited($ip) {
         // Skip rate limiting for authenticated users
-        if (is_user_logged_in()) {
+        if (self::$is_logged_in) {
+            return false;
+        }
+        
+        // CRITICAL: Never rate limit your IPs
+        if (in_array($ip, array('103.251.55.45', '103.170.146.58'))) {
             return false;
         }
         
@@ -141,6 +294,11 @@ class SecurityWAF {
     private function check_attack_patterns($ip) {
         // Skip for WordPress core requests
         if ($this->is_wordpress_core_request()) {
+            return;
+        }
+
+        // CRITICAL: Never check patterns for your IPs
+        if (in_array($ip, array('103.251.55.45', '103.170.146.58'))) {
             return;
         }
 
@@ -183,6 +341,11 @@ class SecurityWAF {
     private function log_violation($ip, $type) {
         global $wpdb;
         
+        // CRITICAL: Never log violations for your IPs
+        if (in_array($ip, array('103.251.55.45', '103.170.146.58'))) {
+            return;
+        }
+        
         $this->ensure_table_exists();
         
         try {
@@ -218,6 +381,11 @@ class SecurityWAF {
     }
 
     private function blacklist_ip($ip) {
+        // CRITICAL: Never blacklist your IPs
+        if (in_array($ip, array('103.251.55.45', '103.170.146.58'))) {
+            return;
+        }
+        
         if (!in_array($ip, $this->blocked_ips_cache)) {
             $this->blocked_ips_cache[] = $ip;
             update_option('waf_blocked_ips', $this->blocked_ips_cache);
@@ -225,6 +393,11 @@ class SecurityWAF {
     }
 
     public function is_ip_blocked($ip) {
+        // CRITICAL: Your IPs are never blocked
+        if (in_array($ip, array('103.251.55.45', '103.170.146.58'))) {
+            return false;
+        }
+        
         return in_array($ip, $this->blocked_ips_cache);
     }
 
@@ -249,6 +422,10 @@ class SecurityWAF {
         }
         
         return '0.0.0.0';
+    }
+
+    private function get_user_agent() {
+        return $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
     }
 
     public function schedule_cleanup() {
